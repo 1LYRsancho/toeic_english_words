@@ -327,8 +327,9 @@ elif menu == "CSVインポート":
 # ----------------------------------------------------
 # 3. 単語帳の管理・統合画面
 # ----------------------------------------------------
+
 elif menu == "単語帳の管理・統合":
-    st.subheader("📋 登録済み単語帳の管理と統合")
+    st.subheader("📋 登録済み単語帳の管理・統合・削除")
     
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -350,12 +351,43 @@ elif menu == "単語帳の管理・統合":
         st.dataframe(df_nb, use_container_width=True)
         
         st.markdown("---")
+        
+        # --- 単語帳の削除機能 ---
+        st.subheader("🗑️ 単語帳の削除")
+        st.write("不要になった単語帳を削除します（中の単語データも一緒に削除されます）。")
+        
+        nb_names_del = [nb[1] for nb in notebooks]
+        target_to_delete = st.selectbox("削除する単語帳を選択", nb_names_del, key="del_select")
+        
+        # 誤操作防止の確認チェックボックス
+        confirm_del = st.checkbox("上記の単語帳を完全に削除することに同意します")
+        
+        if st.button("選択した単語帳を削除する", type="secondary"):
+            if not confirm_del:
+                st.error("削除するには確認のチェックボックスにチェックを入れてください。")
+            else:
+                try:
+                    c.execute("SELECT id FROM notebooks WHERE name = ?", (target_to_delete,))
+                    del_id = c.fetchone()[0]
+                    
+                    # 外部キー制約によりwordsも自動削除されるが、念のため手動でも削除
+                    c.execute("DELETE FROM words WHERE notebook_id = ?", (del_id,))
+                    c.execute("DELETE FROM notebooks WHERE id = ?", (del_id,))
+                    conn.commit()
+                    
+                    st.success(f"🗑️ 単語帳「{target_to_delete}」を削除しました。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"削除エラー: {e}")
+
+        st.markdown("---")
+        
+        # --- 単語帳の統合（マージ）機能 ---
         st.subheader("🔗 単語帳の統合（マージ）")
         st.write("複数の単語帳を1つにまとめて新しい単語帳を作成できます。")
         
-        nb_names = [nb[1] for nb in notebooks]
-        if len(nb_names) >= 2:
-            sources = st.multiselect("統合したい単語帳を複数選択してください", nb_names)
+        if len(nb_names_del) >= 2:
+            sources = st.multiselect("統合したい単語帳を複数選択してください", nb_names_del, key="merge_select")
             new_merged_name = st.text_input("統合後の新しい単語帳の名前")
             
             if st.button("選択した単語帳を統合する", type="primary"):
@@ -365,14 +397,11 @@ elif menu == "単語帳の管理・統合":
                     st.error("統合するには2つ以上の単語帳を選択してください。")
                 else:
                     try:
-                        # 新しい統合先単語帳を作成
                         c.execute("INSERT OR IGNORE INTO notebooks (name) VALUES (?)", (new_merged_name.strip(),))
                         conn.commit()
                         c.execute("SELECT id FROM notebooks WHERE name = ?", (new_merged_name.strip(),))
                         new_id = c.fetchone()[0]
                         
-                        # 選択された単語帳に属するすべての単語の notebook_id を新しいIDに付け替える（またはコピーする）
-                        # ここでは安全にデータをコピーする形にします
                         total_moved = 0
                         for src_name in sources:
                             c.execute("SELECT id FROM notebooks WHERE name = ?", (src_name,))
@@ -383,7 +412,6 @@ elif menu == "単語帳の管理・統合":
                             """, (new_id, src_id))
                             total_moved += c.rowcount
                             
-                            # 空になった元の単語帳を削除する場合
                             c.execute("DELETE FROM notebooks WHERE id = ?", (src_id,))
                         
                         conn.commit()
