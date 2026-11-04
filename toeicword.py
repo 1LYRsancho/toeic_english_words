@@ -2,20 +2,89 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import random
+import os
+import requests
+import base64
 
 DB_NAME = "flashcards_v2.db"
+DB_FILE_PATH = "flashcards_v2.db"
+GITHUB_API_URL = "https://api.github.com"
+
+# ----------------------------------------------------
+# GitHub 同期・バックアップ関数
+# ----------------------------------------------------
+def get_github_credentials():
+    try:
+        token = st.secrets["GITHUB_TOKEN"]
+        repo = st.secrets["GITHUB_REPO"]
+        return token, repo
+    except Exception:
+        return None, None
+
+def download_db_from_github():
+    """起動時にGitHubから最新のDBファイルをダウンロードする"""
+    token, repo = get_github_credentials()
+    if not token or not repo:
+        return  # Secret未設定ならローカル動作
+
+    url = f"{GITHUB_API_URL}/repos/{repo}/contents/{DB_FILE_PATH}"
+    headers = {"Authorization": f"token {token}"}
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        file_info = response.json()
+        download_url = file_info["download_url"]
+        file_content = requests.get(download_url).content
+        with open(DB_NAME, "wb") as f:
+            f.write(file_content)
+
+def upload_db_to_github(commit_message="Update database automatically"):
+    """変更があった際にGitHubのDBファイルを自動更新する"""
+    token, repo = get_github_credentials()
+    if not token or not repo:
+        return
+
+    if not os.path.exists(DB_NAME):
+        return
+
+    url = f"{GITHUB_API_URL}/repos/{repo}/contents/{DB_FILE_PATH}"
+    headers = {"Authorization": f"token {token}"}
+
+    # 既存ファイルのSHAを取得（更新に必要）
+    response = requests.get(url, headers=headers)
+    sha = None
+    if response.status_code == 200:
+        sha = response.json().get("sha")
+
+    # DBファイルを読み込んでBase64エンコード
+    with open(DB_NAME, "rb") as f:
+        content_bytes = f.read()
+    content_encoded = base64.b64encode(content_bytes).decode("utf-8")
+
+    data = {
+        "message": commit_message,
+        "content": content_encoded,
+        "sha": sha
+    }
+
+    requests.put(url, headers=headers, json=data)
+
+# ----------------------------------------------------
+# データベース初期化
+# ----------------------------------------------------
+# アプリ起動時にGitHubから最新DBを取得を試みる
+if not os.path.exists(DB_NAME):
+    download_db_from_github()
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # 単語帳（ノートブック）テーブル
     c.execute('''
         CREATE TABLE IF NOT EXISTS notebooks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL
         )
     ''')
-    # 単語テーブル（どの単語帳に属するかを notebook_id で管理）
     c.execute('''
         CREATE TABLE IF NOT EXISTS words (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +153,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("📚 スマート単語帳（ファイル管理・統合対応版）")
+st.title("📚 スマート単語帳（GitHub同期版）")
 
 menu = st.sidebar.radio("メニュー", ["4択クイズ", "CSVインポート", "単語帳の管理・統合"])
 
@@ -103,17 +172,14 @@ if menu == "4択クイズ":
     else:
         st.subheader("🎯 4択クイズセッション")
         
-        # 学習する単語帳の選択（個別の単語帳、または「すべて統合」）
         nb_options = ["【すべての単語帳を統合して挑戦】"] + [nb[1] for nb in notebooks]
         selected_nb_name = st.selectbox("学習する単語帳を選択", nb_options)
         
-        # ターゲットの notebook_id リストを決定
         if selected_nb_name == "【すべての単語帳を統合して挑戦】":
             target_nb_ids = [nb[0] for nb in notebooks]
         else:
             target_nb_ids = [nb[0] for nb in notebooks if nb[1] == selected_nb_name]
 
-        # 該当する単語数をカウント
         placeholders = ','.join(['?'] * len(target_nb_ids))
         c.execute(f"SELECT COUNT(*) FROM words WHERE notebook_id IN ({placeholders})", target_nb_ids)
         total_words = c.fetchone()[0]
@@ -144,6 +210,10 @@ if menu == "4択クイズ":
                     st.balloons()
                     st.success(f"🎉 30問のセッションが完了しました！")
                     st.metric("今回の正解率", f"{st.session_state.session_score} / 30 問", f"{int(st.session_state.session_score/30*100)}%")
+                    
+                    # セッション終了時にGitHubへ自動バックアップ
+                    upload_db_to_github("Update DB after 30 questions session")
+                    
                     if st.button("次の30問に挑戦する"):
                         st.session_state.session_count = 0
                         st.session_state.session_score = 0
@@ -154,7 +224,6 @@ if menu == "4択クイズ":
                         st.rerun()
                 else:
                     if st.session_state.current_word is None:
-                        # 候補取得
                         c.execute(f"""
                             SELECT * FROM words 
                             WHERE notebook_id IN ({placeholders}) AND available_at_step <= ?
@@ -177,15 +246,12 @@ if menu == "4択クイズ":
                         chosen = random.choice(pool)
                         st.session_state.current_word = chosen
 
-                        # ダミー選択肢の生成
                         word_id, nb_id, q_text, target_ans, wrong_cho, explanation, category, *_ = chosen
                         
                         dummies = []
-                        # wrongChoカラムがあればそこから優先的に抽出
                         if wrong_cho and pd.notna(wrong_cho):
                             dummies = [w.strip() for w in str(wrong_cho).split(';') if w.strip()]
                         
-                        # 不足分を同じ単語帳内からランダム補填
                         if len(dummies) < 3:
                             c.execute(f"SELECT answers FROM words WHERE id != ? AND notebook_id IN ({placeholders}) ORDER BY RANDOM() LIMIT ?", [word_id] + target_nb_ids + [3 - len(dummies)])
                             dummies.extend([r[0] for r in c.fetchall()])
@@ -255,7 +321,7 @@ if menu == "4択クイズ":
         conn.close()
 
 # ----------------------------------------------------
-# 2. CSVインポート画面（ファイルごとに分割保存）
+# 2. CSVインポート画面
 # ----------------------------------------------------
 elif menu == "CSVインポート":
     st.subheader("📥 CSVファイルから新しい単語帳を作成")
@@ -274,7 +340,6 @@ elif menu == "CSVインポート":
 
             df.columns = df.columns.str.strip()
             
-            # カラム名の自動マッピング（英語・日本語対応）
             col_map = {
                 'question': 'question', '単語': 'question', 'word': 'question',
                 'answers': 'answers', '意味': 'answers', 'meaning': 'answers',
@@ -297,7 +362,6 @@ elif menu == "CSVインポート":
                     conn = sqlite3.connect(DB_NAME)
                     c = conn.cursor()
                     
-                    # 単語帳を作成（すでに存在する場合は既存IDを利用）
                     c.execute("INSERT OR IGNORE INTO notebooks (name) VALUES (?)", (final_nb_name,))
                     conn.commit()
                     
@@ -320,14 +384,17 @@ elif menu == "CSVインポート":
                             count += 1
                     conn.commit()
                     conn.close()
-                    st.success(f"🎉 単語帳「{final_nb_name}」に {count} 件の単語を登録しました！")
+                    
+                    # インポート完了時にGitHubへ自動バックアップ
+                    upload_db_to_github(f"Import new notebook: {final_nb_name}")
+                    
+                    st.success(f"🎉 単語帳「{final_nb_name}」に {count} 件の単語を登録しました！（GitHubへも自動保存されました）")
         except Exception as e:
             st.error(f"ファイルの読み込みエラー: {e}")
 
 # ----------------------------------------------------
 # 3. 単語帳の管理・統合画面
 # ----------------------------------------------------
-
 elif menu == "単語帳の管理・統合":
     st.subheader("📋 登録済み単語帳の管理・統合・削除")
     
@@ -340,7 +407,6 @@ elif menu == "単語帳の管理・統合":
         st.info("登録されている単語帳はありません。")
         conn.close()
     else:
-        # 単語帳ごとの単語数を表示
         nb_data = []
         for nb_id, nb_name in notebooks:
             c.execute("SELECT COUNT(*) FROM words WHERE notebook_id = ?", (nb_id,))
@@ -354,12 +420,8 @@ elif menu == "単語帳の管理・統合":
         
         # --- 単語帳の削除機能 ---
         st.subheader("🗑️ 単語帳の削除")
-        st.write("不要になった単語帳を削除します（中の単語データも一緒に削除されます）。")
-        
         nb_names_del = [nb[1] for nb in notebooks]
         target_to_delete = st.selectbox("削除する単語帳を選択", nb_names_del, key="del_select")
-        
-        # 誤操作防止の確認チェックボックス
         confirm_del = st.checkbox("上記の単語帳を完全に削除することに同意します")
         
         if st.button("選択した単語帳を削除する", type="secondary"):
@@ -370,10 +432,12 @@ elif menu == "単語帳の管理・統合":
                     c.execute("SELECT id FROM notebooks WHERE name = ?", (target_to_delete,))
                     del_id = c.fetchone()[0]
                     
-                    # 外部キー制約によりwordsも自動削除されるが、念のため手動でも削除
                     c.execute("DELETE FROM words WHERE notebook_id = ?", (del_id,))
                     c.execute("DELETE FROM notebooks WHERE id = ?", (del_id,))
                     conn.commit()
+                    
+                    # 削除時もGitHubへ自動バックアップ
+                    upload_db_to_github(f"Delete notebook: {target_to_delete}")
                     
                     st.success(f"🗑️ 単語帳「{target_to_delete}」を削除しました。")
                     st.rerun()
@@ -382,10 +446,8 @@ elif menu == "単語帳の管理・統合":
 
         st.markdown("---")
         
-        # --- 単語帳の統合（マージ）機能 ---
+        # --- 単語帳の統合機能 ---
         st.subheader("🔗 単語帳の統合（マージ）")
-        st.write("複数の単語帳を1つにまとめて新しい単語帳を作成できます。")
-        
         if len(nb_names_del) >= 2:
             sources = st.multiselect("統合したい単語帳を複数選択してください", nb_names_del, key="merge_select")
             new_merged_name = st.text_input("統合後の新しい単語帳の名前")
@@ -415,6 +477,10 @@ elif menu == "単語帳の管理・統合":
                             c.execute("DELETE FROM notebooks WHERE id = ?", (src_id,))
                         
                         conn.commit()
+                        
+                        # 統合時もGitHubへ自動バックアップ
+                        upload_db_to_github(f"Merge notebooks into: {new_merged_name}")
+                        
                         st.success(f"🎉 統合完了！新しい単語帳「{new_merged_name}」に {total_moved} 件の単語をまとめました。")
                         st.rerun()
                     except Exception as e:
